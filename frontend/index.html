@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>myAISky</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@400;500;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="container">
+  <header>
+    <div>
+      <h1>my<span>AI</span>Sky</h1>
+      <p class="subtitle">AI Weather &amp; Agent Monitoring Dashboard</p>
+    </div>
+    <div class="badge"><span class="pulse"></span> 24/7 Sandbox Active</div>
+  </header>
+
+  <section class="top">
+    <div class="hero" id="hero" data-mood="clear">
+      <div class="hero-head">
+        <span class="hero-loc" id="h-loc">📍 --</span>
+        <span class="src-pill" id="h-src">--</span>
+      </div>
+      <div class="hero-body">
+        <div class="hero-icon" id="h-icon">⏳</div>
+        <div>
+          <div class="hero-temp"><span id="h-temp">--</span><sup>℃</sup></div>
+          <div class="hero-cond" id="h-cond">불러오는 중…</div>
+        </div>
+      </div>
+      <div class="hero-foot">
+        <span>관측 <b id="h-time">--</b></span>
+        <span>격자 <b id="h-grid">--</b></span>
+        <span id="h-updated">--</span>
+      </div>
+    </div>
+
+    <div class="mini">
+      <div class="card stat"><div class="label">💧 습도</div><div class="value" id="s-hum">--<small>%</small></div><div class="bar"><i id="b-hum"></i></div></div>
+      <div class="card stat"><div class="label">🍃 풍속</div><div class="value" id="s-wind">--<small>m/s</small></div><div class="hint" id="s-wind-hint">--</div></div>
+      <div class="card stat"><div class="label">🔺 오늘 최고</div><div class="value" id="s-max">--<small>℃</small></div></div>
+      <div class="card stat"><div class="label">🔻 오늘 최저</div><div class="value" id="s-min">--<small>℃</small></div></div>
+    </div>
+  </section>
+
+  <section class="main">
+    <div class="left">
+      <div class="card">
+        <h2>📈 온도 트렌드 (24h)</h2>
+        <svg id="chart" viewBox="0 0 600 200" preserveAspectRatio="none"></svg>
+      </div>
+      <div class="card">
+        <h2>🗄 weather_logs 적재 기록 <span class="muted" id="db-count"></span></h2>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>#</th><th>관측 시각</th><th>기온</th><th>상태</th><th>습도</th><th>적재 시각</th></tr></thead>
+            <tbody id="db-rows"><tr><td colspan="6" class="empty">아직 저장된 기록이 없습니다.</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <aside class="log-panel">
+      <h2>🤖 AI 에이전트 실시간 로그 <span class="live">● LIVE</span></h2>
+      <div id="logs"></div>
+    </aside>
+  </section>
+
+  <section class="card">
+    <div class="controls">
+      <div>
+        <h2 style="margin:0">🛠 Manual Control Panel</h2>
+        <p>기상청 데이터를 즉시 동기화(DB 저장 포함)하거나 일일 요약 리포트를 생성합니다.</p>
+      </div>
+      <div class="btns">
+        <button id="btn-sync" class="primary">🔄 데이터 동기화</button>
+        <button id="btn-report">📝 리포트 생성</button>
+      </div>
+    </div>
+    <div id="report"></div>
+  </section>
+
+  <footer>myAISky · FastAPI · 기상청 단기예보 API · <span id="clock"></span></footer>
+</div>
+<script src="/static/app.js"></script>
+</body>
+</html>
