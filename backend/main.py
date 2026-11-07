@@ -120,21 +120,41 @@ def init_db() -> None:
             """
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_weather_logs_ts ON weather_logs(timestamp)")
+        # 같은 관측 시각·격자는 한 번만 저장. 이전 버전에서 쌓인 중복은 가장 먼저 저장된 행만 남김.
+        conn.execute(
+            """
+            DELETE FROM weather_logs WHERE id NOT IN (
+                SELECT MIN(id) FROM weather_logs GROUP BY timestamp, nx, ny
+            )
+            """
+        )
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_weather_logs_obs ON weather_logs(timestamp, nx, ny)"
+        )
 
 
-def save_weather_log(w: WeatherData) -> int:
-    """기상청 실황 데이터를 weather_logs 테이블에 INSERT 하고 행 id 반환."""
+def save_weather_log(w: WeatherData) -> tuple[int, bool]:
+    """기상청 실황 데이터를 weather_logs 에 저장. 같은 관측 시각·격자가 이미 있으면 건너뜀.
+
+    반환: (행 id, 새로 저장했는지 여부)
+    """
     with closing(db_connect()) as conn, conn:
         cur = conn.execute(
             """
-            INSERT INTO weather_logs
+            INSERT OR IGNORE INTO weather_logs
                 (timestamp, temperature, condition, humidity, wind_speed, location, nx, ny, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (w.observed_at, w.temperature, w.condition, w.humidity, w.wind_speed,
              w.location, w.nx, w.ny, datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")),
         )
-        return int(cur.lastrowid)
+        if cur.rowcount:
+            return int(cur.lastrowid), True
+        row = conn.execute(
+            "SELECT id FROM weather_logs WHERE timestamp = ? AND nx = ? AND ny = ?",
+            (w.observed_at, w.nx, w.ny),
+        ).fetchone()
+        return int(row["id"]), False
 
 
 def recent_weather_logs(limit: int = 20) -> list[dict]:
@@ -339,9 +359,12 @@ def get_current_weather(lat: Optional[float] = None, lon: Optional[float] = None
     if nx is not None and ny is not None:
         try:
             weather = fetch_kma_realtime(nx, ny, name)
-            weather.log_id = save_weather_log(weather)
+            weather.log_id, inserted = save_weather_log(weather)
             add_log("OK", f"KMA 실황 수신 ({nx},{ny}): {weather.temperature}℃ / {weather.condition}")
-            add_log("INFO", f"weather_logs INSERT #{weather.log_id}")
+            if inserted:
+                add_log("INFO", f"weather_logs INSERT #{weather.log_id}")
+            else:
+                add_log("INFO", f"{weather.observed_at} 관측분 이미 저장됨 (#{weather.log_id}) → 건너뜀")
             try:
                 om = fetch_open_meteo_weather(lat, lon, name)
                 weather.hourly_temps, weather.hourly_labels = om.hourly_temps, om.hourly_labels
