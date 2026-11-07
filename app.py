@@ -10,6 +10,6 @@ myAISky 진입점 (하위 호환용).
 from backend.main import app  # noqa: F401
 
 if __name__ == "__main__":
-    import uvicorn
+    from backend.main import run
 
-    uvicorn.run("backend.main:app", host="127.0.0.1", port=8000, reload=True)
+    run(reload=True)

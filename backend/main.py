@@ -60,6 +60,13 @@ _load_dotenv(BASE_DIR / ".env")
 KMA_SERVICE_KEY = unquote(os.getenv("KMA_SERVICE_KEY", ""))
 KMA_BASE_URL = "https://apis.data.go.kr/1360000/VilageFcstInfoService_2.0"
 
+# 외부 API 호출: 일시적 지연/끊김에 대비해 재시도하는 세션 사용
+_RETRY = requests.adapters.Retry(total=2, backoff_factor=0.3, status_forcelist=[502, 503, 504])
+HTTP = requests.Session()
+HTTP.mount("https://", requests.adapters.HTTPAdapter(max_retries=_RETRY))
+HTTP.mount("http://", requests.adapters.HTTPAdapter(max_retries=_RETRY))
+HTTP_TIMEOUT = (3, 8)  # (connect, read) 초
+
 # 기본 관측 위치: 서울 — 브라우저 위치 권한이 없을 때 사용
 LOCATION_NAME = "Seoul"
 LAT, LON = 37.5665, 126.9780          # Open-Meteo 보강용 좌표
@@ -227,8 +234,13 @@ def kma_request(operation: str, base: datetime, nx: int, ny: int, rows: int = 10
         "nx": nx,
         "ny": ny,
     }
-    resp = requests.get(f"{KMA_BASE_URL}/{operation}", params=params, timeout=8)
-    resp.raise_for_status()
+    # 요청 URL에 serviceKey가 포함되므로 requests 예외 메시지를 그대로 로그에 노출하지 않음
+    try:
+        resp = HTTP.get(f"{KMA_BASE_URL}/{operation}", params=params, timeout=HTTP_TIMEOUT)
+    except requests.RequestException as e:
+        raise KmaError(f"연결 실패 ({type(e).__name__})") from None
+    if not resp.ok:
+        raise KmaError(f"HTTP {resp.status_code} (인증키/서비스 활용신청 확인)")
     try:
         data = resp.json()
     except ValueError:
@@ -308,7 +320,7 @@ def fetch_open_meteo_weather(lat: float, lon: float, name: str) -> WeatherData:
         "forecast_days": 1,
         "timezone": "auto",
     }
-    resp = requests.get("https://api.open-meteo.com/v1/forecast", params=params, timeout=5)
+    resp = HTTP.get("https://api.open-meteo.com/v1/forecast", params=params, timeout=HTTP_TIMEOUT)
     resp.raise_for_status()
     data = resp.json()
     cur = data["current"]
@@ -445,7 +457,28 @@ def dashboard() -> FileResponse:
     return FileResponse(FRONTEND_DIR / "index.html")
 
 
-if __name__ == "__main__":
+def server_address(port: int) -> tuple[str, str]:
+    """(bind host, 브라우저 접속 URL). Codespaces 에서는 포워딩 주소로 접속해야 하므로 0.0.0.0 바인딩."""
+    codespace = os.getenv("CODESPACE_NAME")
+    if codespace:
+        domain = os.getenv("GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN", "app.github.dev")
+        return "0.0.0.0", f"https://{codespace}-{port}.{domain}"
+    return "127.0.0.1", f"http://127.0.0.1:{port}"
+
+
+def run(reload: bool = False) -> None:
     import uvicorn
 
-    uvicorn.run("backend.main:app", host="127.0.0.1", port=8000)
+    port = int(os.getenv("PORT", "8000"))
+    host, url = server_address(port)
+    print("=" * 60)
+    print(" myAISky 서버 실행 안내")
+    print(f"  브라우저 접속 : {url}")
+    print(f"  API: {url}/api/weather  |  문서: {url}/docs")
+    print(f"  기상청 키     : {'설정됨' if KMA_SERVICE_KEY else '없음 (Open-Meteo 사용)'}")
+    print("=" * 60)
+    uvicorn.run("backend.main:app", host=host, port=port, reload=reload)
+
+
+if __name__ == "__main__":
+    run()
