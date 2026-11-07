@@ -63,7 +63,7 @@ KMA_BASE_URL = "https://apis.data.go.kr/1360000/VilageFcstInfoService_2.0"
 # 기본 관측 위치: 서울 — 브라우저 위치 권한이 없을 때 사용
 LOCATION_NAME = "Seoul"
 LAT, LON = 37.5665, 126.9780          # Open-Meteo 보강용 좌표
-SEOUL_NX, SEOUL_NY = 55, 127          # 기상청 격자 좌표 (요청 사양)
+SEOUL_NX, SEOUL_NY = 60, 127          # 기상청 격자 좌표 (서울 중구·시청)
 
 app = FastAPI(title="myAISky", description="AI Weather & Agent Monitoring Dashboard")
 app.mount("/images", StaticFiles(directory=BASE_DIR / "images"), name="images")
@@ -347,7 +347,7 @@ def sample_weather(name: str) -> WeatherData:
 def get_current_weather(lat: Optional[float] = None, lon: Optional[float] = None) -> WeatherData:
     """KMA(→ DB 저장) → Open-Meteo → 샘플 순으로 시도. 24h 트렌드는 Open-Meteo 로 보강.
 
-    lat/lon 이 없으면 서울 격자(nx=55, ny=127), 있으면 해당 좌표의 격자를 사용.
+    lat/lon 이 없으면 서울 격자(nx=60, ny=127), 있으면 해당 좌표의 격자를 사용.
     """
     if lat is None or lon is None:
         lat, lon, name = LAT, LON, LOCATION_NAME
@@ -386,8 +386,8 @@ def get_current_weather(lat: Optional[float] = None, lon: Optional[float] = None
 
 
 # ─────────────────────────────── API ───────────────────────────────
-LatQ = Query(None, ge=-90, le=90, description="위도 (생략 시 서울 nx=55, ny=127)")
-LonQ = Query(None, ge=-180, le=180, description="경도 (생략 시 서울 nx=55, ny=127)")
+LatQ = Query(None, ge=-90, le=90, description="위도 (생략 시 서울 nx=60, ny=127)")
+LonQ = Query(None, ge=-180, le=180, description="경도 (생략 시 서울 nx=60, ny=127)")
 
 
 @app.get("/api/weather", response_model=WeatherData)

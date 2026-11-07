@@ -109,7 +109,7 @@ async function loadHistory() {
   lastTopId = rows[0].id;
 }
 
-// ── 위치: 브라우저 위치 권한 → 실패/거부 시 서버 기본값(서울 nx=55, ny=127) ──
+// ── 위치: 브라우저 위치 권한 → 실패/거부 시 서버 기본값(서울 nx=60, ny=127) ──
 let coords = null;
 const q = () => coords ? `?lat=${coords.lat.toFixed(4)}&lon=${coords.lon.toFixed(4)}` : '';
 const geoLog = (msg) => fetch('/api/geo-status?status=' + encodeURIComponent(msg), { method: 'POST' });
