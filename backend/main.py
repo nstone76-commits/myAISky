@@ -14,7 +14,10 @@ Encoding 키(%2F, %3D 포함)와 Decoding 키 모두 사용 가능합니다.
     기상청 초단기예보(getUltraSrtFcst) → 하늘상태(SKY) 보강 (강수 없을 때 맑음/구름많음/흐림 판별)
     → SQLite `weather_logs.db` 의 `weather_logs` 테이블에 자동 INSERT
     → GET /api/weather 로 JSON 반환 → frontend/ 대시보드 렌더링
-    KMA 실패 시 Open-Meteo → 샘플 데이터 순으로 대체 (대체 데이터는 DB에 저장하지 않음)
+    KMA 실패 시 KMA 캐시(같은 격자, 3시간 이내) → Open-Meteo → 샘플 데이터 순으로 대체 (대체 데이터는 DB에 저장하지 않음)
+
+백그라운드 수집: 서버 시작 시 daemon 스레드가 즉시 1회, 이후 COLLECT_INTERVAL_SEC(기본 600초)마다
+    서울 기본 격자를 get_current_weather() 로 수집해 weather_logs 에 쌓음. COLLECT_ENABLED=0 이면 끔. 상태는 GET /health 의 collector.
 """
 
 from __future__ import annotations
@@ -23,12 +26,13 @@ import math
 import os
 import re
 import sqlite3
+import threading
 from collections import deque
-from contextlib import closing
+from contextlib import asynccontextmanager, closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
-from urllib.parse import unquote
+from urllib.parse import quote, unquote
 
 import requests
 from fastapi import FastAPI, Query
@@ -72,7 +76,22 @@ LOCATION_NAME = "Seoul"
 LAT, LON = 37.5665, 126.9780          # Open-Meteo 보강용 좌표
 SEOUL_NX, SEOUL_NY = 60, 127          # 기상청 격자 좌표 (서울 중구·시청)
 
-app = FastAPI(title="myAISky", description="AI Weather & Agent Monitoring Dashboard")
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    """서버 시작 시 백그라운드 수집 스레드 시작, 종료 시 정지."""
+    if os.getenv("COLLECT_ENABLED", "1").strip() != "0":
+        start_collector(collect_interval_from_env())
+    else:
+        add_log("INFO", "백그라운드 수집 비활성화 (COLLECT_ENABLED=0)")
+    try:
+        yield
+    finally:
+        stop_collector()
+
+
+app = FastAPI(title="myAISky", description="AI Weather & Agent Monitoring Dashboard", lifespan=lifespan)
 app.mount("/images", StaticFiles(directory=BASE_DIR / "images"), name="images")
 app.mount("/static", StaticFiles(directory=FRONTEND_DIR), name="static")
 
@@ -103,7 +122,7 @@ def add_log(level: str, message: str) -> None:
 
 # ─────────────────────────────── SQLite (weather_logs.db) ───────────────────────────────
 def db_connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=10)  # 수집 스레드·API 요청 동시 쓰기 대비
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -196,6 +215,31 @@ class KmaError(RuntimeError):
         self.code = code
 
 
+KMA_AUTH_COOLDOWN = timedelta(minutes=10)   # 인증 오류(401/403, 키 미등록) 후 KMA 호출 생략 시간
+KMA_CACHE_TTL = timedelta(hours=3)        # 마지막 성공 KMA 데이터(캐시) 허용 범위 (관측 시각 기준)
+KMA_CACHE_SOURCE = "기상청 초단기실황 (캐시)"
+_kma_auth_block_until: Optional[datetime] = None
+_kma_cache: dict[tuple[int, int], WeatherData] = {}   # (nx, ny) → 마지막 성공 KMA 데이터
+
+
+def mask_secret(text: object) -> str:
+    """로그·에러 메시지에서 serviceKey 값을 *** 로 가림."""
+    s = str(text)
+    s = re.sub(r"(serviceKey=)[^&\s'\"]*", r"\1***", s, flags=re.IGNORECASE)
+    if KMA_SERVICE_KEY:
+        for secret in {KMA_SERVICE_KEY, quote(KMA_SERVICE_KEY, safe="")}:
+            s = s.replace(secret, "***")
+    return s
+
+
+def _to_float(value: object) -> Optional[float]:
+    """관측값 → float. 결측·형식 오류면 None."""
+    try:
+        return float(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
 def latlon_to_kma_grid(lat: float, lon: float) -> tuple[int, int]:
     """위경도 → 기상청 동네예보 격자(nx, ny) 변환 (Lambert Conformal Conic, 기상청 공식 파라미터)."""
     RE, GRID = 6371.00877, 5.0
@@ -222,8 +266,11 @@ def in_korea(lat: float, lon: float) -> bool:
 
 def kma_request(operation: str, base: datetime, nx: int, ny: int, rows: int = 100) -> list[dict]:
     """기상청 단기예보 서비스 공통 호출. 정상 응답이면 item 리스트 반환, 아니면 KmaError."""
+    global _kma_auth_block_until
     if not KMA_SERVICE_KEY:
         raise KmaError("KMA_SERVICE_KEY 미설정")
+    if _kma_auth_block_until is not None and datetime.now(KST) < _kma_auth_block_until:
+        raise KmaError(f"인증 오류 쿨다운 중 (~{_kma_auth_block_until:%H:%M}) → KMA 호출 생략", "COOLDOWN")
     params = {
         "serviceKey": KMA_SERVICE_KEY,
         "pageNo": 1,
@@ -238,19 +285,38 @@ def kma_request(operation: str, base: datetime, nx: int, ny: int, rows: int = 10
     try:
         resp = HTTP.get(f"{KMA_BASE_URL}/{operation}", params=params, timeout=HTTP_TIMEOUT)
     except requests.RequestException as e:
-        raise KmaError(f"연결 실패 ({type(e).__name__})") from None
-    if not resp.ok:
-        raise KmaError(f"HTTP {resp.status_code} (인증키/서비스 활용신청 확인)")
+        raise KmaError(f"연결 실패 ({type(e).__name__})", "NETWORK") from None
+    if resp.status_code in (401, 403):
+        _kma_auth_block_until = datetime.now(KST) + KMA_AUTH_COOLDOWN
+        raise KmaError(f"HTTP {resp.status_code} 인증 거부 (키 등록·활용신청 승인 확인 필요)",
+                       f"HTTP_{resp.status_code}")
+    if resp.status_code >= 400:
+        raise KmaError(f"HTTP {resp.status_code} 오류", f"HTTP_{resp.status_code}")
     try:
         data = resp.json()
     except ValueError:
         # 인증 오류 등은 JSON 요청이어도 XML 로 응답됨
-        m = re.search(r"<returnAuthMsg>(.*?)</returnAuthMsg>|<resultMsg>(.*?)</resultMsg>", resp.text)
-        raise KmaError(f"비정상 응답: {(m.group(1) or m.group(2)) if m else resp.text[:120]}")
-    header = data["response"]["header"]
-    if header["resultCode"] != "00":
-        raise KmaError(f"{header['resultCode']} {header['resultMsg']}", header["resultCode"])
-    return data["response"]["body"]["items"]["item"]
+        text = resp.text or ""
+        m = re.search(r"<returnAuthMsg>(.*?)</returnAuthMsg>|<resultMsg>(.*?)</resultMsg>", text)
+        msg = mask_secret((m.group(1) or m.group(2)) if m else text[:120])
+        if re.search(r"SERVICE_KEY|SERVICE ACCESS DENIED|<returnReasonCode>(20|22|30|31|32|33)<", text):
+            _kma_auth_block_until = datetime.now(KST) + KMA_AUTH_COOLDOWN
+            raise KmaError(f"인증 오류 응답: {msg}", "AUTH")
+        raise KmaError(f"비정상 응답: {msg}", "BAD_RESPONSE")
+    try:
+        header = data["response"]["header"]
+        code = str(header["resultCode"])
+        if code != "00":
+            raise KmaError(f"{code} {mask_secret(header.get('resultMsg', ''))}", code)
+        items = data["response"]["body"]["items"]
+        items = items.get("item") if isinstance(items, dict) else None
+    except (KeyError, TypeError, AttributeError) as e:
+        raise KmaError(f"응답 구조 이상 ({type(e).__name__}: {mask_secret(e)})", "PARSE") from None
+    if isinstance(items, dict):  # 항목이 하나면 dict 로 올 수 있음
+        items = [items]
+    if not isinstance(items, list) or not items:
+        raise KmaError("응답 items 비어 있음", "NO_ITEMS")
+    return items
 
 
 def fetch_kma_realtime(nx: int = SEOUL_NX, ny: int = SEOUL_NY, name: str = LOCATION_NAME) -> WeatherData:
@@ -275,9 +341,11 @@ def fetch_kma_realtime(nx: int = SEOUL_NX, ny: int = SEOUL_NY, name: str = LOCAT
                 base -= timedelta(hours=1)
                 continue
             raise
-    values = {it["category"]: it["obsrValue"] for it in items}
-    if "T1H" not in values:
-        raise KmaError("응답에 기온(T1H) 없음")
+    values = {it["category"]: it.get("obsrValue") for it in items
+              if isinstance(it, dict) and "category" in it}
+    temperature = _to_float(values.get("T1H"))
+    if temperature is None:
+        raise KmaError("응답에 기온(T1H) 없음 또는 형식 오류", "NO_T1H")
 
     pty = str(values.get("PTY", "0")).strip()
     condition = KMA_PTY.get(pty, "알 수 없음")
@@ -293,13 +361,13 @@ def fetch_kma_realtime(nx: int = SEOUL_NX, ny: int = SEOUL_NY, name: str = LOCAT
             if sky:
                 condition = KMA_SKY.get(str(sky[0]["fcstValue"]), condition)
         except Exception as e:  # 하늘상태 보강 실패는 치명적이지 않음
-            add_log("WARN", f"하늘상태(SKY) 조회 실패 → 강수형태만 표시 ({e})")
+            add_log("WARN", f"하늘상태(SKY) 조회 실패 → 강수형태만 표시 ({mask_secret(e)})")
 
     return WeatherData(
         location=name,
-        temperature=float(values["T1H"]),
-        humidity=float(values["REH"]) if "REH" in values else None,
-        wind_speed=float(values["WSD"]) if "WSD" in values else None,
+        temperature=temperature,
+        humidity=_to_float(values.get("REH")),
+        wind_speed=_to_float(values.get("WSD")),
         condition=condition,
         source="기상청 초단기실황",
         observed_at=base.strftime("%Y-%m-%d %H:%M"),
@@ -356,8 +424,48 @@ def sample_weather(name: str) -> WeatherData:
     )
 
 
+def kma_cached_weather(nx: int, ny: int, name: str) -> Optional[WeatherData]:
+    """같은 격자의 마지막 성공 KMA 데이터 (메모리 캐시 → weather_logs 최신 행). TTL 초과면 None."""
+    now = datetime.now(KST)
+
+    def fresh(observed_at: str) -> bool:
+        try:
+            obs = datetime.strptime(observed_at, "%Y-%m-%d %H:%M").replace(tzinfo=KST)
+        except (TypeError, ValueError):
+            return False
+        return now - obs <= KMA_CACHE_TTL
+
+    cached = _kma_cache.get((nx, ny))
+    if cached is not None and fresh(cached.observed_at):
+        return cached.model_copy(update={"location": name, "source": KMA_CACHE_SOURCE})
+    try:
+        with closing(db_connect()) as conn:
+            row = conn.execute(
+                "SELECT id, timestamp, temperature, condition, humidity, wind_speed FROM weather_logs "
+                "WHERE nx = ? AND ny = ? ORDER BY timestamp DESC, id DESC LIMIT 1",
+                (nx, ny),
+            ).fetchone()
+    except sqlite3.Error as e:
+        add_log("WARN", f"weather_logs 캐시 조회 실패 ({type(e).__name__}: {e})")
+        return None
+    if row is None or not fresh(row["timestamp"]):
+        return None
+    return WeatherData(
+        location=name,
+        temperature=row["temperature"],
+        humidity=row["humidity"],
+        wind_speed=row["wind_speed"],
+        condition=row["condition"] or "알 수 없음",
+        source=KMA_CACHE_SOURCE,
+        observed_at=row["timestamp"],
+        nx=nx,
+        ny=ny,
+        log_id=row["id"],
+    )
+
+
 def get_current_weather(lat: Optional[float] = None, lon: Optional[float] = None) -> WeatherData:
-    """KMA(→ DB 저장) → Open-Meteo → 샘플 순으로 시도. 24h 트렌드는 Open-Meteo 로 보강.
+    """KMA(→ DB 저장) → KMA 캐시 → Open-Meteo → 샘플 순으로 시도. 24h 트렌드는 Open-Meteo 로 보강.
 
     lat/lon 이 없으면 서울 격자(nx=60, ny=127), 있으면 해당 좌표의 격자를 사용.
     """
@@ -382,9 +490,16 @@ def get_current_weather(lat: Optional[float] = None, lon: Optional[float] = None
                 weather.hourly_temps, weather.hourly_labels = om.hourly_temps, om.hourly_labels
             except Exception:
                 pass
+            _kma_cache[(nx, ny)] = weather.model_copy()
             return weather
         except Exception as e:
-            add_log("WARN", f"KMA API 실패 → 대체 소스 사용 ({e})")
+            code = getattr(e, "code", "") or type(e).__name__
+            add_log("WARN", f"KMA API 실패 [{code}] → 대체 소스 사용 ({mask_secret(e)})")
+        cached = kma_cached_weather(nx, ny, name)
+        if cached is not None:
+            add_log("WARN", f"KMA 캐시 사용 ({nx},{ny}): {cached.observed_at} 관측분 "
+                            f"{cached.temperature}℃ / {cached.condition}")
+            return cached
     else:
         add_log("INFO", "기상청 격자 범위 밖 → Open-Meteo 사용")
 
@@ -395,6 +510,100 @@ def get_current_weather(lat: Optional[float] = None, lon: Optional[float] = None
     except Exception as e:
         add_log("WARN", f"외부 API 연결 실패 → 샘플 데이터 사용 ({type(e).__name__})")
         return sample_weather(name)
+
+
+# ─────────────────────────────── 백그라운드 수집 ───────────────────────────────
+COLLECT_INTERVAL_DEFAULT = 600.0
+COLLECTOR_STATUS: dict = {
+    "enabled": False,           # 스레드 동작 중 여부
+    "interval_sec": None,
+    "runs": 0,                  # 실행 횟수
+    "last_run": None,           # 마지막 실행 시각 (KST ISO)
+    "last_source": None,        # 마지막 결과의 source
+    "consecutive_failures": 0,  # 실시간 KMA 수집 실패(캐시·대체 소스 사용 또는 예외) 연속 횟수
+    "last_error": None,
+}
+_collector_lock = threading.Lock()                 # 한 프로세스에 수집 스레드 하나만 (모듈 수준 가드)
+_collector_thread: Optional[threading.Thread] = None
+_collector_stop = threading.Event()
+
+
+def collect_interval_from_env() -> float:
+    raw = os.getenv("COLLECT_INTERVAL_SEC", str(int(COLLECT_INTERVAL_DEFAULT)))
+    try:
+        interval = float(raw)
+    except ValueError:
+        interval = 0
+    if interval <= 0:
+        add_log("WARN", f"COLLECT_INTERVAL_SEC 값 오류 ({raw!r}) → 기본 {int(COLLECT_INTERVAL_DEFAULT)}초 사용")
+        return COLLECT_INTERVAL_DEFAULT
+    return interval
+
+
+def collect_once() -> None:
+    """서울 기본 격자 1회 수집 (KMA 성공 → DB 저장, 실패 → 캐시·대체 소스). 예외는 로그만 남김."""
+    now = datetime.now(KST).isoformat(timespec="seconds")
+    try:
+        weather = get_current_weather()
+    except Exception as e:  # 스레드가 죽지 않도록 모든 예외를 기록하고 계속
+        with _collector_lock:
+            COLLECTOR_STATUS.update(runs=COLLECTOR_STATUS["runs"] + 1, last_run=now, last_source=None,
+                                    consecutive_failures=COLLECTOR_STATUS["consecutive_failures"] + 1,
+                                    last_error=mask_secret(f"{type(e).__name__}: {e}"))
+        add_log("ERROR", mask_secret(f"백그라운드 수집 실패 ({type(e).__name__}: {e})"))
+        return
+    live = weather.source == "기상청 초단기실황"
+    with _collector_lock:
+        COLLECTOR_STATUS.update(runs=COLLECTOR_STATUS["runs"] + 1, last_run=now, last_source=weather.source,
+                                consecutive_failures=0 if live else COLLECTOR_STATUS["consecutive_failures"] + 1,
+                                last_error=None)
+
+
+def _collector_loop(stop: threading.Event, interval: float) -> None:
+    while not stop.is_set():
+        collect_once()
+        if stop.wait(interval):
+            break
+    with _collector_lock:
+        COLLECTOR_STATUS["enabled"] = False
+
+
+def start_collector(interval: float = COLLECT_INTERVAL_DEFAULT) -> bool:
+    """수집 스레드 시작. 이미 이 프로세스에서 돌고 있으면 False."""
+    global _collector_thread, _collector_stop
+    with _collector_lock:
+        if _collector_thread is not None and _collector_thread.is_alive():
+            return False
+        _collector_stop = threading.Event()
+        _collector_thread = threading.Thread(target=_collector_loop, args=(_collector_stop, interval),
+                                             name="kma-collector", daemon=True)
+        COLLECTOR_STATUS.update(enabled=True, interval_sec=interval)
+        _collector_thread.start()
+    add_log("INFO", f"백그라운드 수집 시작 ({interval:g}초 주기)")
+    return True
+
+
+def stop_collector(timeout: float = 15.0) -> None:
+    """수집 스레드 정지 (진행 중인 수집은 최대 timeout 초 대기)."""
+    global _collector_thread
+    with _collector_lock:
+        thread = _collector_thread
+        _collector_stop.set()
+    if thread is None:
+        return
+    thread.join(timeout)
+    if thread.is_alive():
+        add_log("WARN", "백그라운드 수집 스레드가 제한 시간 안에 종료되지 않음 (daemon 이므로 프로세스와 함께 종료)")
+    else:
+        with _collector_lock:
+            if _collector_thread is thread:
+                _collector_thread = None
+        add_log("INFO", "백그라운드 수집 정지")
+
+
+def collector_status() -> dict:
+    with _collector_lock:
+        return dict(COLLECTOR_STATUS)
 
 
 # ─────────────────────────────── API ───────────────────────────────
@@ -449,7 +658,8 @@ def api_report(lat: Optional[float] = LatQ, lon: Optional[float] = LonQ) -> dict
 
 @app.get("/health")
 def health() -> dict:
-    return {"status": "ok", "time": datetime.now(KST).isoformat(), "kma_key": bool(KMA_SERVICE_KEY)}
+    return {"status": "ok", "time": datetime.now(KST).isoformat(), "kma_key": bool(KMA_SERVICE_KEY),
+            "collector": collector_status()}
 
 
 @app.get("/", include_in_schema=False)
