@@ -16,6 +16,12 @@ import requests
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+# 실제 weather_logs.db 를 건드리지 않도록 backend.main 임포트 전에 임시 DB 경로 지정
+import atexit, tempfile  # noqa: E401,E402
+_TEST_DB = Path(tempfile.gettempdir()) / f"myaisky_test_{os.getpid()}.db"
+os.environ["MYAISKY_DB_PATH"] = str(_TEST_DB)
+atexit.register(lambda: _TEST_DB.unlink(missing_ok=True))
+
 import backend.main as m  # noqa: E402
 
 FAKE_KEY = "FAKE/test+key=="

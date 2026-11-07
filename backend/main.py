@@ -7,6 +7,7 @@ myAISky - AI Weather & Agent Monitoring Dashboard (backend)
     (기존 명령 `uvicorn app:app --reload` 도 그대로 동작)
 
 기상청 API 인증키는 프로젝트 루트의 `.env` 파일(KMA_SERVICE_KEY=...) 또는 환경변수로 지정합니다.
+DB 파일 위치는 환경변수 MYAISKY_DB_PATH 로 바꿀 수 있습니다 (기본: 프로젝트 루트 weather_logs.db).
 Encoding 키(%2F, %3D 포함)와 Decoding 키 모두 사용 가능합니다.
 
 데이터 흐름:
@@ -42,7 +43,6 @@ from pydantic import BaseModel
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 FRONTEND_DIR = BASE_DIR / "frontend"
-DB_PATH = BASE_DIR / "weather_logs.db"
 KST = timezone(timedelta(hours=9))
 
 
@@ -59,6 +59,9 @@ def _load_dotenv(path: Path) -> None:
 
 
 _load_dotenv(BASE_DIR / ".env")
+
+# SQLite 경로: 기본은 프로젝트 루트의 weather_logs.db. 테스트 등에서는 MYAISKY_DB_PATH 로 분리.
+DB_PATH = Path(os.getenv("MYAISKY_DB_PATH") or BASE_DIR / "weather_logs.db")
 
 # requests 가 파라미터를 다시 URL 인코딩하므로, Encoding 키는 디코딩해서 보관 (Decoding 키는 변화 없음)
 KMA_SERVICE_KEY = unquote(os.getenv("KMA_SERVICE_KEY", ""))

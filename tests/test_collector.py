@@ -14,6 +14,12 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+# 실제 weather_logs.db 를 건드리지 않도록 backend.main 임포트 전에 임시 DB 경로 지정
+import atexit, tempfile  # noqa: E401,E402
+_TEST_DB = Path(tempfile.gettempdir()) / f"myaisky_test_{os.getpid()}.db"
+os.environ["MYAISKY_DB_PATH"] = str(_TEST_DB)
+atexit.register(lambda: _TEST_DB.unlink(missing_ok=True))
+
 import backend.main as m  # noqa: E402
 
 INTERVAL = 0.05
@@ -126,6 +132,10 @@ class CollectorTest(unittest.TestCase):
             with mock.patch.dict(os.environ, {"COLLECT_ENABLED": "1", "COLLECT_INTERVAL_SEC": str(INTERVAL)}):
                 asyncio.run(run_lifespan(started))
         self.assertEqual(collector_threads(), [])  # lifespan 종료 시 정지
+
+    def test_tests_use_isolated_db(self):
+        self.assertEqual(m.DB_PATH, _TEST_DB)
+        self.assertNotEqual(m.DB_PATH, m.BASE_DIR / "weather_logs.db")
 
     def test_interval_from_env(self):
         with mock.patch.dict(os.environ, {"COLLECT_INTERVAL_SEC": "15"}):
